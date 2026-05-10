@@ -1,0 +1,443 @@
+services:
+  ###########################################################################
+  # Hermes Agent gateway + dashboard side-process
+  ###########################################################################
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    command: ["gateway", "run"]
+
+    environment:
+      # Gateway API
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8642
+      - API_SERVER_KEY=${SERVICE_PASSWORD_64_HERMESBRIDGE}
+      - API_SERVER_CORS_ORIGINS=${API_SERVER_CORS_ORIGINS:-}
+      - API_SERVER_MODEL_NAME=${API_SERVER_MODEL_NAME:-hermes-agent}
+
+      # Dashboard side-process. Do not run a separate dashboard container.
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_HOST=0.0.0.0
+      - HERMES_DASHBOARD_PORT=9119
+      - HERMES_DASHBOARD_TUI=${HERMES_DASHBOARD_TUI:-}
+
+      # Gateway access policy
+      - GATEWAY_ALLOW_ALL_USERS=false
+
+      # Self-hosted Honcho memory
+      # Local Honcho does not need HONCHO_API_KEY.
+      - HONCHO_BASE_URL=http://honcho-api:8000
+      - HONCHO_API_KEY=${HONCHO_API_KEY:-}
+      - HINDSIGHT_TIMEOUT=${HINDSIGHT_TIMEOUT:-120}
+
+      # LLM provider keys
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+
+      # Browserless / CDP
+      - BROWSER_TOKEN=${SERVICE_PASSWORD_64_HERMESBROWSER}
+      - BROWSER_CDP_URL=ws://hermes-browser:3000/chromium?token=${SERVICE_PASSWORD_64_HERMESBROWSER}
+      - BROWSER_INACTIVITY_TIMEOUT=${BROWSER_INACTIVITY_TIMEOUT:-900}
+
+      # Telegram
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
+      - TELEGRAM_GROUP_ALLOWED_USERS=${TELEGRAM_GROUP_ALLOWED_USERS:-}
+      - TELEGRAM_GROUP_ALLOWED_CHATS=${TELEGRAM_GROUP_ALLOWED_CHATS:-}
+
+      # Discord
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_ALLOWED_USERS=${DISCORD_ALLOWED_USERS:-}
+      - DISCORD_ALLOWED_ROLES=${DISCORD_ALLOWED_ROLES:-}
+      - DISCORD_HOME_CHANNEL=${DISCORD_HOME_CHANNEL:-}
+
+      # Email
+      - EMAIL_ADDRESS=${EMAIL_ADDRESS:-}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD:-}
+      - EMAIL_IMAP_HOST=${EMAIL_IMAP_HOST:-}
+      - EMAIL_SMTP_HOST=${EMAIL_SMTP_HOST:-}
+      - EMAIL_IMAP_PORT=${EMAIL_IMAP_PORT:-993}
+      - EMAIL_SMTP_PORT=${EMAIL_SMTP_PORT:-587}
+      - EMAIL_POLL_INTERVAL=${EMAIL_POLL_INTERVAL:-15}
+      - EMAIL_ALLOWED_USERS=${EMAIL_ALLOWED_USERS:-}
+      - EMAIL_HOME_ADDRESS=${EMAIL_HOME_ADDRESS:-}
+      - EMAIL_ALLOW_ALL_USERS=${EMAIL_ALLOW_ALL_USERS:-false}
+
+      # Webhooks
+      - WEBHOOK_ENABLED=${WEBHOOK_ENABLED:-true}
+      - WEBHOOK_PORT=8644
+      - WEBHOOK_SECRET=${SERVICE_PASSWORD_64_HERMESWEBHOOKS}
+
+    volumes:
+      - hermes-data:/opt/data
+
+    expose:
+      - "8642"
+      - "9119"
+      - "8644"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    depends_on:
+      honcho-api:
+        condition: service_started
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://localhost:8642/health && (curl -fsS http://localhost:9119/api/status || curl -fsS http://localhost:9119/) || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+
+  ###########################################################################
+  # Protected public Dashboard proxy
+  #
+  # This exposes dashboard through a separate service so Traefik BasicAuth
+  # applies only to dashboard, not webhooks.
+  ###########################################################################
+  hermes-dashboard-proxy:
+    image: nginx:alpine
+    depends_on:
+      hermes:
+        condition: service_healthy
+
+    environment:
+      - SERVICE_URL_HERMESDASHBOARD_8080
+      - SERVICE_FQDN_HERMESDASHBOARD_8080
+
+    labels:
+      - "traefik.http.middlewares.hermes-dashboard-auth.basicauth.users=${DASHBOARD_BASIC_AUTH_USERS:?DASHBOARD_BASIC_AUTH_USERS is required. Generate with: htpasswd -nbB admin your-password}"
+      - "coolify.traefik.middlewares=hermes-dashboard-auth"
+
+    command: >
+      sh -c 'cat > /etc/nginx/conf.d/default.conf <<EOF
+      server {
+        listen 8080;
+        server_name _;
+
+        proxy_read_timeout 3600;
+        proxy_send_timeout 3600;
+
+        location / {
+          proxy_pass http://hermes:9119;
+          proxy_http_version 1.1;
+          proxy_set_header Host $$host;
+          proxy_set_header X-Real-IP $$remote_addr;
+          proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $$scheme;
+          proxy_set_header Upgrade $$http_upgrade;
+          proxy_set_header Connection "upgrade";
+        }
+      }
+      EOF
+      nginx -g "daemon off;"'
+
+    expose:
+      - "8080"
+
+    restart: unless-stopped
+
+  ###########################################################################
+  # Public Webhook proxy
+  #
+  # Exposes Hermes webhook listener on 8644 through Coolify.
+  # Security is HMAC-based through WEBHOOK_SECRET.
+  ###########################################################################
+  hermes-webhook-proxy:
+    image: nginx:alpine
+    depends_on:
+      hermes:
+        condition: service_healthy
+
+    environment:
+      - SERVICE_URL_HERMESWEBHOOKS_8080
+      - SERVICE_FQDN_HERMESWEBHOOKS_8080
+
+    command: >
+      sh -c 'cat > /etc/nginx/conf.d/default.conf <<EOF
+      server {
+        listen 8080;
+        server_name _;
+
+        client_max_body_size 2m;
+
+        location / {
+          proxy_pass http://hermes:8644;
+          proxy_http_version 1.1;
+          proxy_set_header Host $$host;
+          proxy_set_header X-Real-IP $$remote_addr;
+          proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $$scheme;
+        }
+      }
+      EOF
+      nginx -g "daemon off;"'
+
+    expose:
+      - "8080"
+
+    restart: unless-stopped
+
+  ###########################################################################
+  # Hermes Workspace UI
+  ###########################################################################
+  workspace-init:
+    image: busybox:latest
+    restart: "no"
+    command: >
+      sh -c "mkdir -p /home/workspace/.hermes
+      && chown -R 1000:1000 /home/workspace/.hermes
+      && chmod -R 750 /home/workspace/.hermes"
+    volumes:
+      - workspace-data:/home/workspace/.hermes
+
+  hermes-workspace:
+    image: ghcr.io/outsourc-e/hermes-workspace:latest
+    user: "1000:1000"
+
+    environment:
+      - SERVICE_URL_HERMESWORKSPACE_3000
+      - SERVICE_FQDN_HERMESWORKSPACE_3000
+
+      - HOST=0.0.0.0
+      - PORT=3000
+
+      - HERMES_API_URL=http://hermes:8642
+      - HERMES_API_TOKEN=${SERVICE_PASSWORD_64_HERMESBRIDGE}
+
+      # Do not set HERMES_DASHBOARD_TOKEN unless you know the exact dashboard bearer.
+      # Wrong value causes /api/sessions 401.
+      - HERMES_DASHBOARD_URL=http://hermes:9119
+
+      - HERMES_PASSWORD=${SERVICE_PASSWORD_64_HERMESWORKSPACE}
+
+      - TRUST_PROXY=1
+      - COOKIE_SECURE=1
+
+      - PUBLIC_URL=${SERVICE_URL_HERMESWORKSPACE_3000}
+      - APP_URL=${SERVICE_URL_HERMESWORKSPACE_3000}
+
+      # Backward compatibility
+      - CLAUDE_API_TOKEN=${SERVICE_PASSWORD_64_HERMESBRIDGE}
+      - CLAUDE_PASSWORD=${SERVICE_PASSWORD_64_HERMESWORKSPACE}
+
+      - STREAM_ACCEPTED_TIMEOUT_MS=${STREAM_ACCEPTED_TIMEOUT_MS:-120000}
+      - STREAM_HANDOFF_TIMEOUT_MS=${STREAM_HANDOFF_TIMEOUT_MS:-300000}
+
+      - VITE_HERMESWORLD_ENABLED=${VITE_HERMESWORLD_ENABLED:-1}
+      - VITE_PLAYGROUND_WS_URL=${VITE_PLAYGROUND_WS_URL:-}
+      - VITE_PLAYGROUND_STATS_URL=${VITE_PLAYGROUND_STATS_URL:-}
+
+    expose:
+      - "3000"
+
+    volumes:
+      - workspace-data:/home/workspace/.hermes
+
+    depends_on:
+      hermes:
+        condition: service_healthy
+      workspace-init:
+        condition: service_completed_successfully
+
+    restart: unless-stopped
+
+  ###########################################################################
+  # Browserless / Chromium
+  ###########################################################################
+  hermes-browser:
+    image: ghcr.io/browserless/chromium:latest
+    user: "0:0"
+    restart: unless-stopped
+    shm_size: "2gb"
+
+    expose:
+      - "3000"
+
+    environment:
+      - TOKEN=${SERVICE_PASSWORD_64_HERMESBROWSER}
+      - KEEP_ALIVE=${BROWSER_KEEP_ALIVE:-true}
+      - DATA_DIR=/data
+      - CONCURRENT=${BROWSER_CONCURRENT:-3}
+      - QUEUED=${BROWSER_QUEUED:-3}
+      - TIMEOUT=${BROWSER_TIMEOUT_MS:-300000}
+
+    volumes:
+      - browser-data:/data
+
+  ###########################################################################
+  # Honcho self-hosted memory stack
+  #
+  # Official Honcho self-hosting builds from source.
+  # If Coolify rejects remote Git build contexts, fork/clone Honcho and deploy
+  # from a repo that contains Honcho's Dockerfile.
+  ###########################################################################
+  honcho-api:
+    build:
+      context: https://github.com/plastic-labs/honcho.git#main
+      dockerfile: Dockerfile
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+
+    depends_on:
+      honcho-database:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+      honcho-db-init:
+        condition: service_completed_successfully
+
+    environment:
+      - DB_CONNECTION_URI=postgresql+psycopg://honcho:${SERVICE_PASSWORD_HONCHODB}@honcho-database:5432/honcho
+      - CACHE_URL=redis://honcho-redis:6379/0?suppress=true
+      - CACHE_ENABLED=true
+
+      - AUTH_USE_AUTH=false
+      - LOG_LEVEL=${HONCHO_LOG_LEVEL:-INFO}
+      - VECTOR_STORE_TYPE=pgvector
+      - VECTOR_STORE_MIGRATED=false
+
+      # Honcho LLM provider. Required.
+      - LLM_OPENAI_API_KEY=${HONCHO_LLM_OPENAI_API_KEY:-}
+      - LLM_ANTHROPIC_API_KEY=${HONCHO_LLM_ANTHROPIC_API_KEY:-}
+      - LLM_GEMINI_API_KEY=${HONCHO_LLM_GEMINI_API_KEY:-}
+
+      # OpenAI-compatible routing, useful for OpenRouter/vLLM/Ollama/LiteLLM.
+      - DERIVER_MODEL_CONFIG__TRANSPORT=${HONCHO_TRANSPORT:-openai}
+      - DERIVER_MODEL_CONFIG__MODEL=${HONCHO_MODEL:-gpt-5.4-mini}
+      - DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL=${HONCHO_OPENAI_BASE_URL:-}
+      - SUMMARY_MODEL_CONFIG__TRANSPORT=${HONCHO_TRANSPORT:-openai}
+      - SUMMARY_MODEL_CONFIG__MODEL=${HONCHO_MODEL:-gpt-5.4-mini}
+      - SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL=${HONCHO_OPENAI_BASE_URL:-}
+      - DREAM_DEDUCTION_MODEL_CONFIG__TRANSPORT=${HONCHO_TRANSPORT:-openai}
+      - DREAM_DEDUCTION_MODEL_CONFIG__MODEL=${HONCHO_MODEL:-gpt-5.4-mini}
+      - DREAM_DEDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL=${HONCHO_OPENAI_BASE_URL:-}
+      - DREAM_INDUCTION_MODEL_CONFIG__TRANSPORT=${HONCHO_TRANSPORT:-openai}
+      - DREAM_INDUCTION_MODEL_CONFIG__MODEL=${HONCHO_MODEL:-gpt-5.4-mini}
+      - DREAM_INDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL=${HONCHO_OPENAI_BASE_URL:-}
+
+      # Embeddings
+      - EMBED_MESSAGES=${HONCHO_EMBED_MESSAGES:-true}
+      - EMBEDDING_MODEL_CONFIG__TRANSPORT=${HONCHO_EMBEDDING_TRANSPORT:-openai}
+      - EMBEDDING_MODEL_CONFIG__MODEL=${HONCHO_EMBEDDING_MODEL:-text-embedding-3-small}
+      - EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=${HONCHO_OPENAI_BASE_URL:-}
+
+    expose:
+      - "8000"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    restart: unless-stopped
+
+  honcho-deriver:
+    build:
+      context: https://github.com/plastic-labs/honcho.git#main
+      dockerfile: Dockerfile
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+
+    depends_on:
+      honcho-database:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+      honcho-db-init:
+        condition: service_completed_successfully
+
+    environment:
+      - DB_CONNECTION_URI=postgresql+psycopg://honcho:${SERVICE_PASSWORD_HONCHODB}@honcho-database:5432/honcho
+      - CACHE_URL=redis://honcho-redis:6379/0?suppress=true
+      - CACHE_ENABLED=true
+
+      - AUTH_USE_AUTH=false
+      - LOG_LEVEL=${HONCHO_LOG_LEVEL:-INFO}
+      - VECTOR_STORE_TYPE=pgvector
+      - VECTOR_STORE_MIGRATED=false
+      - METRICS_ENABLED=false
+
+      # Honcho LLM provider. Required.
+      - LLM_OPENAI_API_KEY=${HONCHO_LLM_OPENAI_API_KEY:-}
+      - LLM_ANTHROPIC_API_KEY=${HONCHO_LLM_ANTHROPIC_API_KEY:-}
+      - LLM_GEMINI_API_KEY=${HONCHO_LLM_GEMINI_API_KEY:-}
+
+      - DERIVER_ENABLED=true
+      - DERIVER_MODEL_CONFIG__TRANSPORT=${HONCHO_TRANSPORT:-openai}
+      - DERIVER_MODEL_CONFIG__MODEL=${HONCHO_MODEL:-gpt-5.4-mini}
+      - DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL=${HONCHO_OPENAI_BASE_URL:-}
+
+      - EMBED_MESSAGES=${HONCHO_EMBED_MESSAGES:-true}
+      - EMBEDDING_MODEL_CONFIG__TRANSPORT=${HONCHO_EMBEDDING_TRANSPORT:-openai}
+      - EMBEDDING_MODEL_CONFIG__MODEL=${HONCHO_EMBEDDING_MODEL:-text-embedding-3-small}
+      - EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=${HONCHO_OPENAI_BASE_URL:-}
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    restart: unless-stopped
+
+  honcho-database:
+    image: pgvector/pgvector:pg15
+    restart: unless-stopped
+
+    command: ["postgres", "-c", "max_connections=200"]
+
+    environment:
+      - POSTGRES_DB=honcho
+      - POSTGRES_USER=honcho
+      - POSTGRES_PASSWORD=${SERVICE_PASSWORD_HONCHODB}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+
+    volumes:
+      - honcho-pgdata:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U honcho -d honcho"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  honcho-db-init:
+    image: pgvector/pgvector:pg15
+    restart: "no"
+
+    depends_on:
+      honcho-database:
+        condition: service_healthy
+
+    environment:
+      - PGPASSWORD=${SERVICE_PASSWORD_HONCHODB}
+
+    command:
+      - sh
+      - -c
+      - |
+        psql -h honcho-database -U honcho -d honcho -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+  honcho-redis:
+    image: redis:8.2
+    restart: unless-stopped
+
+    volumes:
+      - honcho-redis-data:/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  hermes-data:
+  workspace-data:
+  browser-data:
+  honcho-pgdata:
+  honcho-redis-data:
