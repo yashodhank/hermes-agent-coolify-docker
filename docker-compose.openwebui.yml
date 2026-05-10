@@ -1,0 +1,32 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+
+    environment:
+      - SERVICE_URL_OPENWEBUI_8080
+      - SERVICE_FQDN_OPENWEBUI_8080
+
+      # Same-stack default:
+      - OPENAI_API_BASE_URL=${OPENWEBUI_OPENAI_API_BASE_URL:-http://hermes:8642/v1}
+      - OPENAI_API_KEY=${SERVICE_PASSWORD_64_HERMESBRIDGE}
+
+      # Removes empty Ollama backend noise unless you actually use Ollama.
+      - ENABLE_OLLAMA_API=${OPENWEBUI_ENABLE_OLLAMA_API:-false}
+
+    expose:
+      - "8080"
+
+    volumes:
+      - open-webui-data:/app/backend/data
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    depends_on:
+      hermes:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
